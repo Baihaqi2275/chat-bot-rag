@@ -5,14 +5,134 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
+
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const Groq = require('groq-sdk');
+
 const RAGEngine = require('./lib/rag');
 const DatasetManager = require('./lib/dataset');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+/**
+ * =====================================
+ * KONFIGURASI BOT PER KATEGORI
+ * =====================================
+ *
+ * Contoh .env Adela:
+ * BOT_CATEGORY=gelang
+ * BOT_OWNER=Adela
+ * WA_CLIENT_ID=bot-adela-gelang
+ *
+ * Contoh .env Ari:
+ * BOT_CATEGORY=kalung
+ * BOT_OWNER=Ari
+ * WA_CLIENT_ID=bot-ari-kalung
+ *
+ * Contoh .env Fikri:
+ * BOT_CATEGORY=cincin
+ * BOT_OWNER=Fikri
+ * WA_CLIENT_ID=bot-fikri-cincin
+ *
+ * Contoh .env Anting:
+ * BOT_CATEGORY=anting
+ * BOT_OWNER=NamaTeman
+ * WA_CLIENT_ID=bot-anting
+ */
+
+const BOT_CATEGORY = (process.env.BOT_CATEGORY || 'gelang').toLowerCase();
+const BOT_OWNER = process.env.BOT_OWNER || 'Admin';
+
+const SHOP_NAME = process.env.SHOP_NAME || 'Bunga Tanjung Gold';
+const SHOPEE_LINK = process.env.SHOPEE_LINK || 'https://id.shp.ee/2DUgfdtF';
+
+const PRODUCT_CATEGORIES = ['gelang', 'anting', 'cincin', 'kalung'];
+
+const CATEGORY_LABELS = {
+  gelang: 'gelang',
+  kalung: 'kalung',
+  cincin: 'cincin',
+  anting: 'anting'
+};
+
+function getCategoryLabel() {
+  return CATEGORY_LABELS[BOT_CATEGORY] || BOT_CATEGORY;
+}
+
+function getMentionedOtherCategory(message) {
+  const lowerMessage = (message || '').toLowerCase();
+
+  return PRODUCT_CATEGORIES.find(category =>
+    category !== BOT_CATEGORY && lowerMessage.includes(category)
+  );
+}
+
+function buildWelcomeMenu() {
+  const categoryLabel = getCategoryLabel();
+
+  return (
+    `Halo Kak, selamat datang di ${SHOP_NAME}.\n` +
+    `Saya asisten toko yang siap membantu Kakak mencari produk ${categoryLabel}.\n\n` +
+    `Silakan pilih layanan:\n` +
+    `1. Cek produk tersedia\n` +
+    `2. Cari produk\n` +
+    `3. Lihat detail produk\n` +
+    `4. Cari produk berdasarkan harga\n` +
+    `5. Bantuan admin\n\n` +
+    `Kakak bisa balas dengan angka pilihan, atau langsung tulis kebutuhan Kakak.\n\n` +
+    `Untuk pembelian, Kakak bisa langsung melalui Shopee toko kami:\n` +
+    `${SHOPEE_LINK}`
+  );
+}
+
+function normalizeMenuOption(message) {
+  const text = (message || '').toLowerCase().trim();
+  const categoryLabel = getCategoryLabel();
+
+  if (text === '1') {
+    return `Tampilkan produk ${categoryLabel} yang tersedia di dataset. Berikan beberapa pilihan produk dengan nama dan harga jika ada.`;
+  }
+
+  if (text === '2') {
+    return `Bantu cari produk ${categoryLabel} yang cocok untuk pelanggan berdasarkan dataset. Tanyakan kebutuhan pelanggan jika kata kunci produk belum jelas.`;
+  }
+
+  if (text === '3') {
+    return `Jelaskan detail produk ${categoryLabel} yang tersedia berdasarkan dataset. Jika nama produk belum disebutkan, minta pelanggan menyebutkan nama produk yang ingin dilihat detailnya.`;
+  }
+
+  if (text === '4') {
+    return `Bantu cari produk ${categoryLabel} berdasarkan harga. Jika pelanggan belum menyebutkan budget atau rentang harga, minta pelanggan menyebutkan budgetnya.`;
+  }
+
+  if (text === '5') {
+    return `Berikan bantuan admin untuk pelanggan yang ingin bertanya lebih lanjut tentang produk ${categoryLabel}, pemesanan, atau pembelian melalui Shopee. Sertakan link Shopee toko: ${SHOPEE_LINK}`;
+  }
+
+  return message;
+}
+
+function isMenuKeyword(message) {
+  const text = (message || '').toLowerCase().trim();
+
+  return [
+    'halo',
+    'hai',
+    'hi',
+    'hello',
+    'menu',
+    'mulai',
+    'start',
+    'bantuan',
+    'help',
+    'gl',
+    'kl',
+    'cc',
+    'at'
+  ].includes(text);
+}
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -33,7 +153,12 @@ let isCleaning = false;
 let isInitializing = false;
 
 const handledMessageIds = new Set();
-const userSession = new Map();
+
+/**
+ * Menyimpan chat yang sudah pernah disapa.
+ * Jadi pesan pertama dari setiap nomor akan langsung dibalas menu.
+ */
+const greetedChats = new Set();
 
 const knowledgeFile = path.join(__dirname, 'knowledge.json');
 const behaviorFile = path.join(__dirname, 'config', 'behavior.json');
@@ -50,7 +175,7 @@ function loadKnowledge() {
     const data = fs.readFileSync(knowledgeFile, 'utf8');
     return JSON.parse(data);
   } catch (error) {
-    console.error('Error loading knowledge:', error.message);
+    console.error('Error loading knowledge:', error);
     return { keywords: {}, responses: {} };
   }
 }
@@ -61,7 +186,7 @@ function saveKnowledge(data) {
     ragEngine.clearCache();
     return true;
   } catch (error) {
-    console.error('Error saving knowledge:', error.message);
+    console.error('Error saving knowledge:', error);
     return false;
   }
 }
@@ -92,22 +217,26 @@ function saveBehavior(obj) {
 async function getAIResponse(message, contextItems = [], behavior = null) {
   try {
     const contextBlock = ragEngine.buildContextBlock(contextItems);
+    const categoryLabel = getCategoryLabel();
 
     if (!behavior) {
       behavior = loadBehavior() || {
         system_instructions:
-          'Jawab hanya berdasarkan konteks yang diberikan. Jika tidak ada jawaban, tampilkan fallback.',
+          `Anda adalah chatbot customer service ${SHOP_NAME}. ` +
+          `Anda hanya boleh menjawab berdasarkan konteks dataset yang diberikan. ` +
+          `Bot ini hanya melayani kategori ${categoryLabel}. ` +
+          `Gunakan sapaan Kak dan gaya bahasa ramah seperti admin toko online.`,
         fallback_response:
-          'Mohon maaf, informasi tersebut tidak tersedia di data toko kami.',
-        max_sentences: 2,
+          `Mohon maaf Kak, informasi itu belum tersedia untuk kategori ${categoryLabel}.`,
+        max_sentences: 3,
         language: 'id'
       };
     }
 
-    if (!behavior.ignoreContextCheck && (!contextBlock || contextItems.length === 0)) {
+    if (!contextBlock || contextItems.length === 0) {
       return (
         behavior.fallback_response ||
-        'Mohon maaf, informasi tersebut tidak tersedia di data toko kami.'
+        `Mohon maaf Kak, informasi itu belum tersedia untuk kategori ${categoryLabel}.`
       );
     }
 
@@ -117,22 +246,32 @@ async function getAIResponse(message, contextItems = [], behavior = null) {
       systemParts.push(behavior.system_instructions);
     }
 
-    if (!behavior.ignoreContextCheck) {
-      systemParts.push(
-        `Jawab hanya menggunakan konteks berikut. Jika konteks tidak memadai, jawab: ${behavior.fallback_response}`
-      );
-    }
+    systemParts.push(
+      `Bot ini milik ${BOT_OWNER} dan hanya melayani kategori ${categoryLabel}.`
+    );
 
-    if (!behavior.ignoreSentenceLimit) {
-      systemParts.push(
-        `Jawab maksimal ${behavior.max_sentences || 2} kalimat. Bahasa: ${
-          behavior.language || 'id'
-        }.`
-      );
-    }
+    systemParts.push(
+      `Jawab dengan gaya ramah, sopan, singkat, dan natural seperti admin toko online. Gunakan sapaan "Kak".`
+    );
+
+    systemParts.push(
+      `Jawab hanya berdasarkan konteks berikut. Jangan mengarang nama produk, harga, stok, bahan, promo, atau detail lain yang tidak ada di konteks.`
+    );
+
+    systemParts.push(
+      `Jika konteks tidak memadai, jawab: ${behavior.fallback_response}`
+    );
+
+    systemParts.push(
+      `Jika pelanggan ingin membeli, arahkan ke link Shopee: ${SHOPEE_LINK}`
+    );
+
+    systemParts.push(
+      `Jawab maksimal ${behavior.max_sentences || 3} kalimat. Bahasa: ${behavior.language || 'id'}.`
+    );
 
     const systemMessage = systemParts.join(' ');
-    const userMessage = `Konteks:\n${contextBlock || 'Informasi produk ada pada instruksi sistem'}\n\nPertanyaan: ${message}`;
+    const userMessage = `Konteks:\n${contextBlock}\n\nPertanyaan: ${message}`;
 
     const completion = await groq.chat.completions.create({
       messages: [
@@ -140,7 +279,7 @@ async function getAIResponse(message, contextItems = [], behavior = null) {
         { role: 'user', content: userMessage }
       ],
       model: process.env.GROQ_MODEL || 'llama-3.1-8b-instant',
-      max_tokens: Number(process.env.GROQ_MAX_TOKENS || 200),
+      max_tokens: Number(process.env.GROQ_MAX_TOKENS || 250),
       temperature: 0.1
     });
 
@@ -191,7 +330,9 @@ function initializeClient() {
   if (client) return client;
 
   client = new Client({
-    authStrategy: new LocalAuth({ clientId: 'whatsapp-bot' }),
+    authStrategy: new LocalAuth({
+      clientId: process.env.WA_CLIENT_ID || `whatsapp-bot-${BOT_CATEGORY}`
+    }),
     puppeteer: {
       headless: true,
       args: [
@@ -209,9 +350,9 @@ function initializeClient() {
     }
   });
 
-  client.on('qr', (qr) => {
-    console.log('QR Code Generated');
-    console.log('\nScan QR Code di bawah untuk connect bot:\n');
+  client.on('qr', qr => {
+    console.log('📱 QR Code Generated');
+    console.log('\n🔗 Scan QR Code di bawah untuk connect bot:\n');
 
     qrCodeData = qr;
     qrcode.generate(qr, { small: true });
@@ -220,17 +361,21 @@ function initializeClient() {
   });
 
   client.on('ready', () => {
-    console.log('Bot is ready!');
+    console.log('✅ Bot is ready!');
+    console.log(`👤 Bot owner: ${BOT_OWNER}`);
+    console.log(`🏷️ Kategori bot: ${BOT_CATEGORY}`);
+
     isReady = true;
     isCleaning = false;
   });
 
   client.on('authenticated', () => {
-    console.log('Client authenticated');
+    console.log('✅ Client authenticated');
   });
 
-  client.on('disconnected', (reason) => {
-    console.log('Client disconnected:', reason);
+  client.on('disconnected', reason => {
+    console.log('❌ Client disconnected:', reason);
+
     isReady = false;
     client = null;
   });
@@ -238,9 +383,7 @@ function initializeClient() {
   const handleIncomingMessage = async (msg, eventName) => {
     try {
       console.log(
-        `${eventName} event: from=${msg.from}, fromMe=${msg.fromMe}, body=${JSON.stringify(
-          msg.body
-        )}`
+        `${eventName} event: from=${msg.from}, fromMe=${msg.fromMe}, body=${JSON.stringify(msg.body)}`
       );
 
       const messageId =
@@ -248,7 +391,7 @@ function initializeClient() {
 
       if (messageId) {
         if (handledMessageIds.has(messageId)) {
-          console.log('Ignoring duplicate event for same message');
+          console.log('↪ Ignoring duplicate event for same message');
           return;
         }
 
@@ -260,17 +403,15 @@ function initializeClient() {
       }
 
       if (msg.fromMe) {
-        console.log('Ignoring self-sent message');
+        console.log('Ignoring self-sent message to avoid reply loop');
         return;
       }
 
-      const isPersonalChat =
-        msg.from.endsWith('@c.us') || msg.from.endsWith('@lid');
-
+      const isPersonalChat = msg.from.endsWith('@c.us') || msg.from.endsWith('@lid');
       const isNotStatus = !msg.from.endsWith('@status');
 
       if (!isPersonalChat || !isNotStatus) {
-        console.log('Ignoring non-personal message');
+        console.log(`Ignoring non-personal or status message: from=${msg.from}`);
         return;
       }
 
@@ -280,271 +421,30 @@ function initializeClient() {
         const chat = await msg.getChat();
         await chat.sendStateTyping();
       } catch (e) {
-        console.log('Cannot show typing indicator');
+        console.log('Note: Cannot show typing indicator');
       }
 
-      const keyword = msg.body.toLowerCase().trim();
-      const senderNumber = msg.from;
+      const chatId = msg.from;
+      const incomingText = (msg.body || '').trim();
 
-      const menuKeywords = ['menu', 'halo', 'hi', 'start', 'mulai', 'hai', 'hello', 'assalamualaikum', 'pagi', 'siang', 'sore', 'malam', 'p', 'test', 'tes'];
-      const bantuanMenuKeywords = ['bantuan', 'help', 'bisa apa'];
-      const kalungKeywords = ['kl', 'kalung'];
-      const gelangKeywords = ['gl', 'gelang'];
-      const cincinKeywords = ['cc', 'cincin'];
-      const antingKeywords = ['at', 'anting'];
+      /**
+       * =====================================
+       * PESAN PERTAMA WAJIB TAMPILKAN MENU
+       * =====================================
+       *
+       * Apa pun isi pesan pertama user,
+       * bot langsung membalas menu layanan.
+       */
 
-      const isFirstMessage = !userSession.has(senderNumber);
-      
-      // Match if keyword exactly matches, or if it contains variations of menu
-      const isMenuTrigger = menuKeywords.some(word => {
-        const regex = new RegExp(`\\b${word}\\b`, 'i');
-        return regex.test(keyword);
-      }) || keyword === 'p' || /menu|mnu|menunya|minu/i.test(keyword);
-
-      const isBantuanTrigger = bantuanMenuKeywords.some(word => {
-        const regex = new RegExp(`\\b${word}\\b`, 'i');
-        return regex.test(keyword);
-      });
-
-      const isKalung = kalungKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
-      const isGelang = gelangKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
-      const isCincin = cincinKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
-      const isAnting = antingKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
-
-      if (isBantuanTrigger) {
-        await msg.reply(`Halo! Ini yang bisa aku bantu 😊\n\n🛍️ *Produk & Katalog*\n• Lihat daftar produk per kategori\n• Cari produk berdasarkan nama\n• Info harga produk\n\n💡 *Rekomendasi*\n• Rekomendasi produk sesuai budget\n• Rekomendasi produk untuk hadiah\n\n🛒 *Pembelian*\n• Link produk langsung ke Shopee\n• Info cara pesan di Shopee\n\n📦 *Pengiriman & Pesanan*\n• Info estimasi pengiriman\n• Cara cek status pesanan\n\n📞 *Lainnya*\n• Info toko Bunga Tanjung Official Shop\n• Hubungi admin toko\n\n—\nKetik *Menu* untuk lihat kategori produk`);
-        return;
-      }
-
-      if (isMenuTrigger || (isFirstMessage && !isKalung && !isGelang && !isCincin && !isAnting && !isBantuanTrigger && !/^[1-9][0-9]*$/.test(keyword))) {
-        userSession.set(senderNumber, 'menu');
-        
-        const menuVariations = [
-          `Halo Kak! Selamat datang di *Bunga Tanjung Official Shop* 💍✨\nToko perhiasan terpercaya di Shopee!\n\nSilakan pilih kategori produk kami:\n\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\n*BANTUAN* → Lihat semua yang bisa aku bantu\n\nKami siap melayanimu!`,
-          `Hai! Senang bertemu denganmu di *Bunga Tanjung Official Shop* 💍✨\nLagi cari perhiasan apa hari ini kak?\n\nKetik kode di bawah untuk lihat koleksi kami:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nKetik *BANTUAN* kalau butuh panduan ya!`,
-          `Selamat datang di *Bunga Tanjung Official Shop*! 💍✨\nPusat perhiasan terlengkap dan terpercaya.\n\nYuk intip koleksi cantik kami:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nAda yang bisa dibantu? Ketik *BANTUAN* ya kak!`,
-          `Halo! Selamat datang di *Bunga Tanjung Official Shop* 💍✨\nPerhiasan elegan menantimu!\n\nPilih kategori yang kamu suka yuk:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nKetik *BANTUAN* untuk bantuan lebih lanjut 😊`
-        ];
-        const randomMenu = menuVariations[Math.floor(Math.random() * menuVariations.length)];
-        
-        await msg.reply(randomMenu);
-        return;
-      }
-
-      if (isKalung) {
-        userSession.set(senderNumber, 'kalung');
-        const listProduk = `1. KALUNG ITALY SANTA DEWASA UNISEX EMAS 17K BUNGA TANJUNG GOLD - Rp 5.056.000\n2. KALUNG SUPER FLAT HOLOGRAM FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 13.860.000\n3. KALUNG HERME ROSE GOLD EMAS 17K BUNGA TANJUNG GOLD - Rp 7.809.000\n4. KALUNG HOLLOW LUXURY EMAS 17K BUNGA TANJUNG GOLD - Rp 5.292.000\n5. KALUNG CLOVER ARSIR BUNGA 5 EMAS 17K BUNGA TANJUNG GOLD - Rp 12.852.000\n6. KALUNG SOLENE ETERNA BLOOM SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 10.836.000\n7. KALUNG VAR 42 EMAS 17K BUNGA TANJUNG GOLD - Rp 9.027.850\n8. KALUNG POLOS SERUT RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.276.000\n9. KALUNG SOLENE NELDJU SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 7.560.000\n10. KALUNG HOLLOW TETES LIE EMAS 17K BUNGA TANJUNG GOLD - Rp 5.796.000`;
-        await msg.reply(`Ini dia koleksi *Kalung* kami yang cantik! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
-        return;
-      }
-
-      if (isGelang) {
-        userSession.set(senderNumber, 'gelang');
-        const listProduk = `1. GELANG TALI PIXIU PI XIU CHARM DRAGON EMAS 23K BUNGA TANJUNG GOLD - Rp 3.850.000\n2. GELANG WILLOW LEAF DAUN EMAS 17K BUNGA TANJUNG GOLD - Rp 6.450.000\n3. GELANG CLASSIC KOREA TWIST SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 2.890.000\n4. GELANG CHARLOTTE GOLD LARGE EMAS 17K BUNGA TANJUNG GOLD - Rp 8.750.000\n5. GELANG HERME BELL EMAS 17K BUNGA TANJUNG GOLD - Rp 5.950.000\n6. GELANG FANIA TWIN LAYER KUPU EMAS 18K BUNGA TANJUNG GOLD - Rp 4.120.000\n7. GELANG CLOVER FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 5.340.000\n8. GELANG CHARLOTTE GOLD SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.150.000\n9. GELANG LUXURY RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.680.000\n10. GELANG PAPERCLIP VARIASI EMAS 17K BUNGA TANJUNG GOLD - Rp 4.790.000`;
-        await msg.reply(`Ini dia koleksi *Gelang* kami yang elegan! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
-        return;
-      }
-
-      if (isCincin) {
-        userSession.set(senderNumber, 'cincin');
-        const listProduk = `1. CINCIN NIKAH DAPHNE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.500.000\n2. CINCIN NIKAH SABINA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.850.000\n3. CINCIN NIKAH QEELA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.200.000\n4. CINCIN NIKAH MARETTA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.100.000\n5. CINCIN NIKAH KEYNA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.650.000\n6. CINCIN NIKAH FALYN WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.350.000\n7. CINCIN NIKAH LIANA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.900.000\n8. CINCIN NIKAH RENATA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.750.000\n9. CINCIN NIKAH CHLOE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.250.000\n10. CINCIN NIKAH FARRA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.400.000`;
-        await msg.reply(`Ini dia koleksi *Cincin* kami yang memesona! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
-        return;
-      }
-
-      if (isAnting) {
-        userSession.set(senderNumber, 'anting');
-        const listProduk = `1. ANTING KOLONGAN BAYI BABY EMAS KADAR 17K BUNGA TANJUNG - Rp 1.250.000\n2. ANTING JEPIT BLINK EMAS 17K BUNGA TANJUNG GOLD - Rp 2.450.000\n3. ANTING TINDIK CLOVER LY EMAS 17K BUNGA TANJUNG GOLD - Rp 1.850.000\n4. ANTING TINDIK ATOM SUPER RINGAN ROSE EMAS 17K BUNGA TANJUNG GOLD - Rp 1.450.000\n5. ANTING TINDIK TETES AIR EMAS 17K BUNGA TANJUNG GOLD - Rp 2.150.000\n6. ANTING KLIP KUPU KUPU BLINK B EMAS 17K BUNGA TANJUNG GOLD - Rp 2.850.000\n7. ANTING TINDIK KIPAS BS EMAS 17K BUNGA TANJUNG GOLD - Rp 1.950.000\n8. ANTING KLIP FLOWER C EMAS 17K BUNGA TANJUNG GOLD - Rp 2.650.000\n9. ANTING KLIP LISTRING E EMAS 17K BUNGA TANJUNG GOLD - Rp 2.300.000\n10. ANTING KLIP CLOVER A EMAS 17K BUNGA TANJUNG GOLD - Rp 2.750.000`;
-        await msg.reply(`Ini dia koleksi *Anting* kami yang menawan! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
-        return;
-      }
-
-      // Old greetings logic commented out to prevent conflict with menuKeywords
-      /*
-      const greetings = [
-        'halo',
-        'hai',
-        'hello',
-        'hi',
-        'assalamualaikum',
-        'pagi',
-        'siang',
-        'sore',
-        'malam'
-      ];
-      */
-
-      const tokoKeywords = [
-        'nama toko',
-        'toko apa',
-        'ini toko apa',
-        'siapa nama toko',
-        'tokonya apa'
-      ];
-
-      const lokasiKeywords = [
-        'lokasi',
-        'alamat',
-        'dimana toko',
-        'toko dimana',
-        'lokasi toko',
-        'alamat toko'
-      ];
-
-      const bantuanKeywords = [
-        'bisa bantu',
-        'mau tanya',
-        'bantuan',
-        'tolong',
-        'admin',
-        'cs',
-        'customer service'
-      ];
-
-      const produkKeywords = [
-        'produk apa saja',
-        'jual apa',
-        'ada produk apa',
-        'barang apa saja',
-        'kategori produk',
-        'produk yang dijual',
-        'menjual apa'
-      ];
-
-      const diskonKeywords = [
-        'diskon',
-        'promo',
-        'potongan harga',
-        'sale',
-        'gratis ongkir',
-        'voucher'
-      ];
-
-      const pembayaranKeywords = [
-        'pembayaran',
-        'bayar',
-        'transfer',
-        'cod',
-        'cash on delivery',
-        'qris',
-        'dana',
-        'ovo',
-        'gopay',
-        'shopeepay',
-        'metode pembayaran'
-      ];
-
-      const pengirimanKeywords = [
-        'pengiriman',
-        'ongkir',
-        'kurir',
-        'dikirim',
-        'estimasi',
-        'berapa hari',
-        'jasa kirim'
-      ];
-
-      const stokKeywords = [
-        'stok',
-        'tersedia',
-        'ready',
-        'masih ada',
-        'habis'
-      ];
-
-      const outsideKeywords = [
-        'politik',
-        'presiden',
-        'matematika',
-        'coding',
-        'program',
-        'berita',
-        'sekolah',
-        'tugas',
-        'game',
-        'film',
-        'lagu',
-        'resep',
-        'cuaca'
-      ];
-
-      // Old greetings response commented out
-      /*
-      if (greetings.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Halo, selamat datang di Bunga Tanjung Official Shop. Saya bisa bantu informasi seputar produk perhiasan seperti kalung, harga, dan detail produk.'
-        );
-        return;
-      }
-      */
-
-      if (tokoKeywords.some((word) => {
-        const regex = new RegExp(`\\b${word}\\b`, 'i');
-        return regex.test(keyword);
-      })) {
-        await msg.reply(
-          'Nama toko kami adalah Bunga Tanjung Official Shop, toko perhiasan yang menyediakan produk seperti kalung, gelang, cincin, dan anting.'
-        );
-        return;
-      }
-
-      if (lokasiKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Toko Bunga Tanjung Official Shop berlokasi di Denpasar, Bali.'
-        );
-        return;
-      }
-
-      if (bantuanKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Tentu, saya bisa bantu. Silakan tanyakan produk perhiasan seperti kalung, harga produk, detail produk, pembayaran, pengiriman, atau promo toko kami.'
-        );
-        return;
-      }
-
-      if (produkKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Toko Bunga Tanjung Official Shop menjual produk perhiasan seperti kalung, gelang, cincin, anting, dan perhiasan anak-anak. Untuk dataset saat ini, produk yang tersedia adalah kategori kalung.'
-        );
-        return;
-      }
-
-      if (diskonKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Untuk informasi diskon atau promo, silakan cek langsung di halaman Shopee Bunga Tanjung Official Shop karena promo dapat berubah sewaktu-waktu.'
-        );
-        return;
-      }
-
-      if (pembayaranKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Pembayaran dapat mengikuti metode yang tersedia di Shopee, seperti ShopeePay, transfer bank, COD jika tersedia, kartu debit/kredit, dan metode pembayaran lain yang muncul saat checkout.'
-        );
-        return;
-      }
-
-      if (pengirimanKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Pengiriman mengikuti pilihan kurir yang tersedia di Shopee. Estimasi pengiriman dan ongkir dapat dilihat saat checkout sesuai alamat pembeli.'
-        );
-        return;
-      }
-
-      if (stokKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Untuk stok produk, silakan sebutkan nama produk yang ingin dicek. Saya akan membantu mencocokkan dengan data produk yang tersedia.'
-        );
-        return;
-      }
-
-      if (outsideKeywords.some((word) => keyword.includes(word))) {
-        await msg.reply(
-          'Mohon maaf, saya hanya dapat membantu pertanyaan seputar produk dan informasi toko Bunga Tanjung Official Shop.'
-        );
+      if (!greetedChats.has(chatId)) {
+        greetedChats.add(chatId);
+        await msg.reply(buildWelcomeMenu());
+        console.log('Replied with first-message welcome menu');
         return;
       }
 
       const knowledge = loadKnowledge();
+      const keyword = incomingText.toLowerCase();
 
       if (knowledge.responses[keyword]) {
         await msg.reply(knowledge.responses[keyword]);
@@ -552,66 +452,98 @@ function initializeClient() {
         return;
       }
 
-      const allDocuments = datasetManager.getAllDocuments();
+      /**
+       * Kalau user mengetik halo/menu/start setelah pesan pertama,
+       * menu tetap bisa muncul lagi.
+       */
+
+      if (isMenuKeyword(incomingText)) {
+        await msg.reply(buildWelcomeMenu());
+        console.log('Replied with requested welcome menu');
+        return;
+      }
+
+      /**
+       * =====================================
+       * FILTER KATEGORI LAIN
+       * =====================================
+       *
+       * Contoh:
+       * BOT_CATEGORY=gelang
+       * User tanya "ada kalung?"
+       * Bot langsung menolak dan mengarahkan ke halaman utama.
+       */
+
+      const normalizedMessage = normalizeMenuOption(incomingText);
+      const mentionedOtherCategory = getMentionedOtherCategory(normalizedMessage);
+
+      if (mentionedOtherCategory) {
+        await msg.reply(
+          `Mohon maaf Kak, bot ${BOT_OWNER} hanya melayani kategori ${getCategoryLabel()}. ` +
+          `Untuk kategori ${mentionedOtherCategory}, silakan pilih tombol kategori yang sesuai di halaman utama ya.`
+        );
+        return;
+      }
+
+      /**
+       * =====================================
+       * AMBIL DATASET SESUAI BOT_CATEGORY
+       * =====================================
+       *
+       * BOT_CATEGORY=gelang -> data/gelang.csv
+       * BOT_CATEGORY=kalung -> data/kalung.csv
+       * BOT_CATEGORY=cincin -> data/cincin.csv
+       * BOT_CATEGORY=anting -> data/anting.csv
+       *
+       * File shopee.csv boleh tetap ada,
+       * tapi tidak dipakai untuk bot kategori.
+       */
+
+      const categoryDocuments = datasetManager.getDatasetDocuments(BOT_CATEGORY);
+
+      console.log(`📦 Bot owner: ${BOT_OWNER}`);
+      console.log(`🏷️ Kategori bot: ${BOT_CATEGORY}`);
+      console.log(`📄 Dokumen dataset ditemukan: ${categoryDocuments.length}`);
+
+      if (!categoryDocuments.length) {
+        await msg.reply(
+          `Mohon maaf Kak, dataset untuk kategori ${getCategoryLabel()} belum ditemukan. ` +
+          `Pastikan file data/${BOT_CATEGORY}.csv sudah ada ya.`
+        );
+        return;
+      }
 
       const contextItems = ragEngine.retrieveContext(
-        msg.body,
-        allDocuments,
+        normalizedMessage,
+        categoryDocuments,
         Number(process.env.RAG_TOP_K || 3)
       );
 
-      console.log(
-        `RAG Retrieved ${contextItems.length} relevant context(s)`
-      );
+      console.log(`🔍 RAG Retrieved ${contextItems.length} relevant context(s)`);
 
       const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('AI response timeout')), 15000)
       );
 
       try {
-        const behavior = loadBehavior() || { system_instructions: '' };
-        let customBehavior = { ...behavior };
-        
-        const ruleText = `Aturan:\n- Jika pelanggan ketik angka 1–10, tampilkan detail produk sesuai nomor tersebut\n- Jika pelanggan tanya budget tertentu, rekomendasikan produk yang sesuai\n- Jika pelanggan ingin beli, arahkan ke link Shopee produk tersebut\n- ANGKA BUKAN PILIHAN KATEGORI, angka = nomor produk di daftar ini\n- PENTING: Jika pelanggan mengirim pesan yang TIDAK jelas, sekadar sapaan santai, atau di luar konteks produk, JANGAN MENGARANG JAWABAN. Cukup balas persis dengan kalimat ini: "Mohon maaf, saat ini saya hanya melayani pertanyaan seputar produk Bunga Tanjung. Ketik *Menu* untuk kembali ke halaman utama."\n\nTampilkan informasi lengkap produk yang dipilih pelanggan berdasarkan nomornya.\n\nFormat balasan:\n———————————————\n🛍️ *[NAMA PRODUK]*\n\n💰 Harga: Rp [HARGA]\n🏷️ Kategori: [KATEGORI]\n📝 Deskripsi: [DESKRIPSI PRODUK]\n\n🛒 Beli sekarang di Shopee:\n[LINK PRODUK]\n———————————————\nKetik *Menu* untuk kembali 🏠\nKetik kode kategori untuk lihat produk lain 🔠`;
-
-        const currentCategory = userSession.get(senderNumber);
-        
-        if (currentCategory) {
-          customBehavior.ignoreContextCheck = true;
-          customBehavior.ignoreSentenceLimit = true;
-        }
-
-        if (currentCategory === 'kalung') {
-          customBehavior.system_instructions = `Kamu adalah asisten produk kategori KALUNG di Bunga Tanjung Official Shop.\n\nData produk kalung yang tersedia:\n1. KALUNG ITALY SANTA DEWASA UNISEX EMAS 17K BUNGA TANJUNG GOLD - Rp 5.056.000 - https://shopee.co.id/KALUNG-ITALY-SANTA-DEWASA-UNISEX-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.12907109035\n2. KALUNG SUPER FLAT HOLOGRAM FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 13.860.000 - https://shopee.co.id/KALUNG-SUPER-FLAT-HOLOGRAM-FLOWER-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.41375778931\n3. KALUNG HERME ROSE GOLD EMAS 17K BUNGA TANJUNG GOLD - Rp 7.809.000 - https://shopee.co.id/KALUNG-HERME-ROSE-GOLD-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.10189979051\n4. KALUNG HOLLOW LUXURY EMAS 17K BUNGA TANJUNG GOLD - Rp 5.292.000 - https://shopee.co.id/KALUNG-HOLLOW-LUXURY-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.41410520579\n5. KALUNG CLOVER ARSIR BUNGA 5 EMAS 17K BUNGA TANJUNG GOLD - Rp 12.852.000 - https://shopee.co.id/KALUNG-CLOVER-ARSIR-BUNGA-5-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27808251560\n6. KALUNG SOLENE ETERNA BLOOM SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 10.836.000 - https://shopee.co.id/KALUNG-SOLENE-ETERNA-BLOOM-SYIFA-HADJU-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.42980436422\n7. KALUNG VAR 42 EMAS 17K BUNGA TANJUNG GOLD - Rp 9.027.850 - https://shopee.co.id/KALUNG-VAR-42-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28080584329\n8. KALUNG POLOS SERUT RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.276.000 - https://shopee.co.id/KALUNG-POLOS-SERUT-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16869984451\n9. KALUNG SOLENE NELDJU SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 7.560.000 - https://shopee.co.id/KALUNG-SOLENE-NELDJU-SYIFA-HADJU-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.57459608612\n10. KALUNG HOLLOW TETES LIE EMAS 17K BUNGA TANJUNG GOLD - Rp 5.796.000 - https://shopee.co.id/KALUNG-HOLLOW-TETES-LIE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.51309756294\n\n${ruleText}`;
-        } else if (currentCategory === 'gelang') {
-          customBehavior.system_instructions = `Kamu adalah asisten produk kategori GELANG di Bunga Tanjung Official Shop.\n\nData produk gelang yang tersedia:\n1. GELANG TALI PIXIU PI XIU CHARM DRAGON EMAS 23K BUNGA TANJUNG GOLD - Rp 3.850.000 - https://shopee.co.id/GELANG-TALI-PIXIU-PI-XIU-CHARM-DRAGON-EMAS-23K-BUNGA-TANJUNG-GOLD-i.48895190.14100954145\n2. GELANG WILLOW LEAF DAUN EMAS 17K BUNGA TANJUNG GOLD - Rp 6.450.000 - https://shopee.co.id/GELANG-WILLOW-LEAF-DAUN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.26380245317\n3. GELANG CLASSIC KOREA TWIST SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 2.890.000 - https://shopee.co.id/GELANG-CLASSIC-KOREA-TWIST-SUPER-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.24691751226\n4. GELANG CHARLOTTE GOLD LARGE EMAS 17K BUNGA TANJUNG GOLD - Rp 8.750.000 - https://shopee.co.id/GELANG-CHARLOTTE-GOLD-LARGE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.14371428306\n5. GELANG HERME BELL EMAS 17K BUNGA TANJUNG GOLD - Rp 5.950.000 - https://shopee.co.id/GELANG-HERME-BELL-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.17000780680\n6. GELANG FANIA TWIN LAYER KUPU EMAS 18K BUNGA TANJUNG GOLD - Rp 4.120.000 - https://shopee.co.id/GELANG-FANIA-TWIN-LAYER-KUPU-EMAS-18K-BUNGA-TANJUNG-GOLD-i.48895190.45410494905\n7. GELANG CLOVER FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 5.340.000 - https://shopee.co.id/GELANG-CLOVER-FLOWER-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22039932427\n8. GELANG CHARLOTTE GOLD SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.150.000 - https://shopee.co.id/GELANG-CHARLOTTE-GOLD-SUPER-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28682898388\n9. GELANG LUXURY RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.680.000 - https://shopee.co.id/GELANG-LUXURY-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.23068676071\n10. GELANG PAPERCLIP VARIASI EMAS 17K BUNGA TANJUNG GOLD - Rp 4.790.000 - https://shopee.co.id/GELANG-PAPERCLIP-VARIASI-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.17625874784\n\n${ruleText}`;
-        } else if (currentCategory === 'cincin') {
-          customBehavior.system_instructions = `Kamu adalah asisten produk kategori CINCIN di Bunga Tanjung Official Shop.\n\nData produk cincin yang tersedia:\n1. CINCIN NIKAH DAPHNE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.500.000 - https://shopee.co.id/CINCIN-NIKAH-DAPHNE-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.20182095735\n2. CINCIN NIKAH SABINA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.850.000 - https://shopee.co.id/CINCIN-NIKAH-SABINA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.29844774891\n3. CINCIN NIKAH QEELA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.200.000 - https://shopee.co.id/CINCIN-NIKAH-QEELA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.54309979785\n4. CINCIN NIKAH MARETTA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.100.000 - https://shopee.co.id/CINCIN-NIKAH-MARETTA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28676038237\n5. CINCIN NIKAH KEYNA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.650.000 - https://shopee.co.id/CINCIN-NIKAH-KEYNA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22852625776\n6. CINCIN NIKAH FALYN WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.350.000 - https://shopee.co.id/CINCIN-NIKAH-FALYN-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16895554931\n7. CINCIN NIKAH LIANA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.900.000 - https://shopee.co.id/CINCIN-NIKAH-LIANA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22746439452\n8. CINCIN NIKAH RENATA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.750.000 - https://shopee.co.id/CINCIN-NIKAH-RENATA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28179816101\n9. CINCIN NIKAH CHLOE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.250.000 - https://shopee.co.id/CINCIN-NIKAH-CHLOE-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16792327862\n10. CINCIN NIKAH FARRA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.400.000 - https://shopee.co.id/CINCIN-NIKAH-FARRA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.24126805720\n\n${ruleText}`;
-        } else if (currentCategory === 'anting') {
-          customBehavior.system_instructions = `Kamu adalah asisten produk kategori ANTING di Bunga Tanjung Official Shop.\n\nData produk anting yang tersedia:\n1. ANTING KOLONGAN BAYI BABY EMAS KADAR 17K BUNGA TANJUNG - Rp 1.250.000 - https://shopee.co.id/ANTING-KOLONGAN-BAYI-BABY-EMAS-KADAR-17K-BUNGA-TANJUNG-i.48895190.22329430632\n2. ANTING JEPIT BLINK EMAS 17K BUNGA TANJUNG GOLD - Rp 2.450.000 - https://shopee.co.id/ANTING-JEPIT-BLINK-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.21057737936\n3. ANTING TINDIK CLOVER LY EMAS 17K BUNGA TANJUNG GOLD - Rp 1.850.000 - https://shopee.co.id/ANTING-TINDIK-CLOVER-LY-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22559447947\n4. ANTING TINDIK ATOM SUPER RINGAN ROSE EMAS 17K BUNGA TANJUNG GOLD - Rp 1.450.000 - https://shopee.co.id/ANTING-TINDIK-ATOM-SUPER-RINGAN-ROSE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.55904370292\n5. ANTING TINDIK TETES AIR EMAS 17K BUNGA TANJUNG GOLD - Rp 2.150.000 - https://shopee.co.id/ANTING-TINDIK-TETES-AIR-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27755932774\n6. ANTING KLIP KUPU KUPU BLINK B EMAS 17K BUNGA TANJUNG GOLD - Rp 2.850.000 - https://shopee.co.id/ANTING-KLIP-KUPU-KUPU-BLINK-B-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.53356754186\n7. ANTING TINDIK KIPAS BS EMAS 17K BUNGA TANJUNG GOLD - Rp 1.950.000 - https://shopee.co.id/ANTING-TINDIK-KIPAS-BS-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.43022899115\n8. ANTING KLIP FLOWER C EMAS 17K BUNGA TANJUNG GOLD - Rp 2.650.000 - https://shopee.co.id/ANTING-KLIP-FLOWER-C-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27987809894\n9. ANTING KLIP LISTRING E EMAS 17K BUNGA TANJUNG GOLD - Rp 2.300.000 - https://shopee.co.id/ANTING-KLIP-LISTRING-E-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27837288430\n10. ANTING KLIP CLOVER A EMAS 17K BUNGA TANJUNG GOLD - Rp 2.750.000 - https://shopee.co.id/ANTING-KLIP-CLOVER-A-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.23873730300\n\n${ruleText}`;
-        }
+        const behavior = loadBehavior();
 
         const aiResponse = await Promise.race([
-          getAIResponse(msg.body, contextItems, customBehavior),
+          getAIResponse(normalizedMessage, contextItems, behavior),
           timeoutPromise
         ]);
 
         if (aiResponse) {
           await msg.reply(aiResponse);
-
-          console.log(
-            `Replied with AI response (RAG contexts: ${contextItems.length})`
-          );
+          console.log(`Replied with AI response. Contexts: ${contextItems.length}`);
         } else {
-          await msg.reply(
-            'Maaf, saya tidak memahami pesan Anda. Silakan coba lagi.'
-          );
+          await msg.reply('Maaf Kak, saya belum bisa memahami pesan Kakak. Boleh coba tulis ulang ya.');
         }
       } catch (aiError) {
         console.error('AI Error:', aiError.message);
 
         await msg.reply(
-          'Maaf, terjadi kesalahan dalam memproses pesan. Silakan coba lagi.'
+          'Maaf Kak, terjadi kesalahan saat memproses pesan. Silakan coba lagi ya.'
         );
       }
     } catch (error) {
@@ -619,11 +551,8 @@ function initializeClient() {
     }
   };
 
-  client.on('message', (msg) => handleIncomingMessage(msg, 'message'));
-
-  client.on('message_create', (msg) =>
-    handleIncomingMessage(msg, 'message_create')
-  );
+  client.on('message', msg => handleIncomingMessage(msg, 'message'));
+  client.on('message_create', msg => handleIncomingMessage(msg, 'message_create'));
 
   return client;
 }
@@ -633,7 +562,9 @@ app.get('/api/bot/status', (req, res) => {
     isReady,
     isCleaning,
     isInitializing,
-    hasQRCode: qrCodeData ? true : false
+    hasQRCode: qrCodeData ? true : false,
+    category: BOT_CATEGORY,
+    owner: BOT_OWNER
   });
 });
 
@@ -645,8 +576,7 @@ app.post('/api/bot/start', async (req, res) => {
     console.error('Error starting bot:', error.message);
 
     res.status(500).json({
-      message:
-        'Error memulai bot. Pastikan koneksi internet stabil dan coba lagi.',
+      message: 'Error memulai bot. Pastikan koneksi internet stabil dan coba lagi.',
       success: false
     });
   }
@@ -705,7 +635,9 @@ app.get('/api/bot/qr', (req, res) => {
 app.get('/api/datasets', (req, res) => {
   res.json({
     datasets: datasetManager.listDatasets(),
-    totalDocuments: datasetManager.getAllDocuments().length
+    totalDocuments: datasetManager.getAllDocuments().length,
+    activeCategory: BOT_CATEGORY,
+    activeCategoryDocuments: datasetManager.getDatasetDocuments(BOT_CATEGORY).length
   });
 });
 
@@ -860,13 +792,20 @@ app.post('/api/behavior', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server berjalan di http://localhost:${PORT}`);
-  console.log(`Admin Dashboard: http://localhost:${PORT}`);
-  console.log(`Datasets loaded: ${datasetManager.listDatasets().length}`);
+  console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
+  console.log(`🖥️ Admin Dashboard: http://localhost:${PORT}`);
+  console.log(`👤 Bot owner: ${BOT_OWNER}`);
+  console.log(`🏷️ Kategori aktif: ${BOT_CATEGORY}`);
+  console.log(`🏪 Nama toko: ${SHOP_NAME}`);
+  console.log(`🛒 Link Shopee: ${SHOPEE_LINK}`);
+  console.log(`📚 Datasets loaded: ${datasetManager.listDatasets().length}`);
+  console.log(
+    `📄 Dokumen kategori ${BOT_CATEGORY}: ${datasetManager.getDatasetDocuments(BOT_CATEGORY).length}`
+  );
 
   if (process.env.AUTO_START_BOT !== 'false') {
     setTimeout(() => {
-      startBot().catch((error) => {
+      startBot().catch(error => {
         console.error('Error auto-starting bot:', error.message);
       });
     }, 500);

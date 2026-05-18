@@ -1,4 +1,6 @@
-node_modules
+node_modules/
 .env
-.wwebjs_auth
-.wwebjs_cache
+.wwebjs_auth/
+.wwebjs_cache/
+KEYAPI.TXT
+*.rar
