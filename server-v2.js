@@ -33,6 +33,7 @@ let isCleaning = false;
 let isInitializing = false;
 
 const handledMessageIds = new Set();
+const userSession = new Map();
 
 const knowledgeFile = path.join(__dirname, 'knowledge.json');
 const behaviorFile = path.join(__dirname, 'config', 'behavior.json');
@@ -103,7 +104,7 @@ async function getAIResponse(message, contextItems = [], behavior = null) {
       };
     }
 
-    if (!contextBlock || contextItems.length === 0) {
+    if (!behavior.ignoreContextCheck && (!contextBlock || contextItems.length === 0)) {
       return (
         behavior.fallback_response ||
         'Mohon maaf, informasi tersebut tidak tersedia di data toko kami.'
@@ -116,18 +117,22 @@ async function getAIResponse(message, contextItems = [], behavior = null) {
       systemParts.push(behavior.system_instructions);
     }
 
-    systemParts.push(
-      `Jawab hanya menggunakan konteks berikut. Jika konteks tidak memadai, jawab: ${behavior.fallback_response}`
-    );
+    if (!behavior.ignoreContextCheck) {
+      systemParts.push(
+        `Jawab hanya menggunakan konteks berikut. Jika konteks tidak memadai, jawab: ${behavior.fallback_response}`
+      );
+    }
 
-    systemParts.push(
-      `Jawab maksimal ${behavior.max_sentences || 2} kalimat. Bahasa: ${
-        behavior.language || 'id'
-      }.`
-    );
+    if (!behavior.ignoreSentenceLimit) {
+      systemParts.push(
+        `Jawab maksimal ${behavior.max_sentences || 2} kalimat. Bahasa: ${
+          behavior.language || 'id'
+        }.`
+      );
+    }
 
     const systemMessage = systemParts.join(' ');
-    const userMessage = `Konteks:\n${contextBlock}\n\nPertanyaan: ${message}`;
+    const userMessage = `Konteks:\n${contextBlock || 'Informasi produk ada pada instruksi sistem'}\n\nPertanyaan: ${message}`;
 
     const completion = await groq.chat.completions.create({
       messages: [
@@ -279,7 +284,83 @@ function initializeClient() {
       }
 
       const keyword = msg.body.toLowerCase().trim();
+      const senderNumber = msg.from;
 
+      const menuKeywords = ['menu', 'halo', 'hi', 'start', 'mulai', 'hai', 'hello', 'assalamualaikum', 'pagi', 'siang', 'sore', 'malam', 'p', 'test', 'tes'];
+      const bantuanMenuKeywords = ['bantuan', 'help', 'bisa apa'];
+      const kalungKeywords = ['kl', 'kalung'];
+      const gelangKeywords = ['gl', 'gelang'];
+      const cincinKeywords = ['cc', 'cincin'];
+      const antingKeywords = ['at', 'anting'];
+
+      const isFirstMessage = !userSession.has(senderNumber);
+      
+      // Match if keyword exactly matches, or if it contains variations of menu
+      const isMenuTrigger = menuKeywords.some(word => {
+        const regex = new RegExp(`\\b${word}\\b`, 'i');
+        return regex.test(keyword);
+      }) || keyword === 'p' || /menu|mnu|menunya|minu/i.test(keyword);
+
+      const isBantuanTrigger = bantuanMenuKeywords.some(word => {
+        const regex = new RegExp(`\\b${word}\\b`, 'i');
+        return regex.test(keyword);
+      });
+
+      const isKalung = kalungKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
+      const isGelang = gelangKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
+      const isCincin = cincinKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
+      const isAnting = antingKeywords.some(word => keyword === word || keyword.startsWith(word + ' '));
+
+      if (isBantuanTrigger) {
+        await msg.reply(`Halo! Ini yang bisa aku bantu 😊\n\n🛍️ *Produk & Katalog*\n• Lihat daftar produk per kategori\n• Cari produk berdasarkan nama\n• Info harga produk\n\n💡 *Rekomendasi*\n• Rekomendasi produk sesuai budget\n• Rekomendasi produk untuk hadiah\n\n🛒 *Pembelian*\n• Link produk langsung ke Shopee\n• Info cara pesan di Shopee\n\n📦 *Pengiriman & Pesanan*\n• Info estimasi pengiriman\n• Cara cek status pesanan\n\n📞 *Lainnya*\n• Info toko Bunga Tanjung Official Shop\n• Hubungi admin toko\n\n—\nKetik *Menu* untuk lihat kategori produk`);
+        return;
+      }
+
+      if (isMenuTrigger || (isFirstMessage && !isKalung && !isGelang && !isCincin && !isAnting && !isBantuanTrigger && !/^[1-9][0-9]*$/.test(keyword))) {
+        userSession.set(senderNumber, 'menu');
+        
+        const menuVariations = [
+          `Halo Kak! Selamat datang di *Bunga Tanjung Official Shop* 💍✨\nToko perhiasan terpercaya di Shopee!\n\nSilakan pilih kategori produk kami:\n\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\n*BANTUAN* → Lihat semua yang bisa aku bantu\n\nKami siap melayanimu!`,
+          `Hai! Senang bertemu denganmu di *Bunga Tanjung Official Shop* 💍✨\nLagi cari perhiasan apa hari ini kak?\n\nKetik kode di bawah untuk lihat koleksi kami:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nKetik *BANTUAN* kalau butuh panduan ya!`,
+          `Selamat datang di *Bunga Tanjung Official Shop*! 💍✨\nPusat perhiasan terlengkap dan terpercaya.\n\nYuk intip koleksi cantik kami:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nAda yang bisa dibantu? Ketik *BANTUAN* ya kak!`,
+          `Halo! Selamat datang di *Bunga Tanjung Official Shop* 💍✨\nPerhiasan elegan menantimu!\n\nPilih kategori yang kamu suka yuk:\n💎 *KL* → Kalung\n✨ *GL* → Gelang\n💍 *CC* → Cincin\n👂 *AT* → Anting\n\nKetik *BANTUAN* untuk bantuan lebih lanjut 😊`
+        ];
+        const randomMenu = menuVariations[Math.floor(Math.random() * menuVariations.length)];
+        
+        await msg.reply(randomMenu);
+        return;
+      }
+
+      if (isKalung) {
+        userSession.set(senderNumber, 'kalung');
+        const listProduk = `1. KALUNG ITALY SANTA DEWASA UNISEX EMAS 17K BUNGA TANJUNG GOLD - Rp 5.056.000\n2. KALUNG SUPER FLAT HOLOGRAM FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 13.860.000\n3. KALUNG HERME ROSE GOLD EMAS 17K BUNGA TANJUNG GOLD - Rp 7.809.000\n4. KALUNG HOLLOW LUXURY EMAS 17K BUNGA TANJUNG GOLD - Rp 5.292.000\n5. KALUNG CLOVER ARSIR BUNGA 5 EMAS 17K BUNGA TANJUNG GOLD - Rp 12.852.000\n6. KALUNG SOLENE ETERNA BLOOM SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 10.836.000\n7. KALUNG VAR 42 EMAS 17K BUNGA TANJUNG GOLD - Rp 9.027.850\n8. KALUNG POLOS SERUT RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.276.000\n9. KALUNG SOLENE NELDJU SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 7.560.000\n10. KALUNG HOLLOW TETES LIE EMAS 17K BUNGA TANJUNG GOLD - Rp 5.796.000`;
+        await msg.reply(`Ini dia koleksi *Kalung* kami yang cantik! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
+        return;
+      }
+
+      if (isGelang) {
+        userSession.set(senderNumber, 'gelang');
+        const listProduk = `1. GELANG TALI PIXIU PI XIU CHARM DRAGON EMAS 23K BUNGA TANJUNG GOLD - Rp 3.850.000\n2. GELANG WILLOW LEAF DAUN EMAS 17K BUNGA TANJUNG GOLD - Rp 6.450.000\n3. GELANG CLASSIC KOREA TWIST SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 2.890.000\n4. GELANG CHARLOTTE GOLD LARGE EMAS 17K BUNGA TANJUNG GOLD - Rp 8.750.000\n5. GELANG HERME BELL EMAS 17K BUNGA TANJUNG GOLD - Rp 5.950.000\n6. GELANG FANIA TWIN LAYER KUPU EMAS 18K BUNGA TANJUNG GOLD - Rp 4.120.000\n7. GELANG CLOVER FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 5.340.000\n8. GELANG CHARLOTTE GOLD SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.150.000\n9. GELANG LUXURY RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.680.000\n10. GELANG PAPERCLIP VARIASI EMAS 17K BUNGA TANJUNG GOLD - Rp 4.790.000`;
+        await msg.reply(`Ini dia koleksi *Gelang* kami yang elegan! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
+        return;
+      }
+
+      if (isCincin) {
+        userSession.set(senderNumber, 'cincin');
+        const listProduk = `1. CINCIN NIKAH DAPHNE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.500.000\n2. CINCIN NIKAH SABINA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.850.000\n3. CINCIN NIKAH QEELA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.200.000\n4. CINCIN NIKAH MARETTA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.100.000\n5. CINCIN NIKAH KEYNA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.650.000\n6. CINCIN NIKAH FALYN WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.350.000\n7. CINCIN NIKAH LIANA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.900.000\n8. CINCIN NIKAH RENATA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.750.000\n9. CINCIN NIKAH CHLOE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.250.000\n10. CINCIN NIKAH FARRA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.400.000`;
+        await msg.reply(`Ini dia koleksi *Cincin* kami yang memesona! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
+        return;
+      }
+
+      if (isAnting) {
+        userSession.set(senderNumber, 'anting');
+        const listProduk = `1. ANTING KOLONGAN BAYI BABY EMAS KADAR 17K BUNGA TANJUNG - Rp 1.250.000\n2. ANTING JEPIT BLINK EMAS 17K BUNGA TANJUNG GOLD - Rp 2.450.000\n3. ANTING TINDIK CLOVER LY EMAS 17K BUNGA TANJUNG GOLD - Rp 1.850.000\n4. ANTING TINDIK ATOM SUPER RINGAN ROSE EMAS 17K BUNGA TANJUNG GOLD - Rp 1.450.000\n5. ANTING TINDIK TETES AIR EMAS 17K BUNGA TANJUNG GOLD - Rp 2.150.000\n6. ANTING KLIP KUPU KUPU BLINK B EMAS 17K BUNGA TANJUNG GOLD - Rp 2.850.000\n7. ANTING TINDIK KIPAS BS EMAS 17K BUNGA TANJUNG GOLD - Rp 1.950.000\n8. ANTING KLIP FLOWER C EMAS 17K BUNGA TANJUNG GOLD - Rp 2.650.000\n9. ANTING KLIP LISTRING E EMAS 17K BUNGA TANJUNG GOLD - Rp 2.300.000\n10. ANTING KLIP CLOVER A EMAS 17K BUNGA TANJUNG GOLD - Rp 2.750.000`;
+        await msg.reply(`Ini dia koleksi *Anting* kami yang menawan! \n\n${listProduk}\n\n*1-10* → Info lebih lanjut produk \n*Menu* → Kembali ke halaman utama \n*BANTUAN* → Lihat semua fitur `);
+        return;
+      }
+
+      // Old greetings logic commented out to prevent conflict with menuKeywords
+      /*
       const greetings = [
         'halo',
         'hai',
@@ -291,6 +372,7 @@ function initializeClient() {
         'sore',
         'malam'
       ];
+      */
 
       const tokoKeywords = [
         'nama toko',
@@ -386,14 +468,20 @@ function initializeClient() {
         'cuaca'
       ];
 
+      // Old greetings response commented out
+      /*
       if (greetings.some((word) => keyword.includes(word))) {
         await msg.reply(
           'Halo, selamat datang di Bunga Tanjung Official Shop. Saya bisa bantu informasi seputar produk perhiasan seperti kalung, harga, dan detail produk.'
         );
         return;
       }
+      */
 
-      if (tokoKeywords.some((word) => keyword.includes(word))) {
+      if (tokoKeywords.some((word) => {
+        const regex = new RegExp(`\\b${word}\\b`, 'i');
+        return regex.test(keyword);
+      })) {
         await msg.reply(
           'Nama toko kami adalah Bunga Tanjung Official Shop, toko perhiasan yang menyediakan produk seperti kalung, gelang, cincin, dan anting.'
         );
@@ -481,10 +569,30 @@ function initializeClient() {
       );
 
       try {
-        const behavior = loadBehavior();
+        const behavior = loadBehavior() || { system_instructions: '' };
+        let customBehavior = { ...behavior };
+        
+        const ruleText = `Aturan:\n- Jika pelanggan ketik angka 1–10, tampilkan detail produk sesuai nomor tersebut\n- Jika pelanggan tanya budget tertentu, rekomendasikan produk yang sesuai\n- Jika pelanggan ingin beli, arahkan ke link Shopee produk tersebut\n- ANGKA BUKAN PILIHAN KATEGORI, angka = nomor produk di daftar ini\n- PENTING: Jika pelanggan mengirim pesan yang TIDAK jelas, sekadar sapaan santai, atau di luar konteks produk, JANGAN MENGARANG JAWABAN. Cukup balas persis dengan kalimat ini: "Mohon maaf, saat ini saya hanya melayani pertanyaan seputar produk Bunga Tanjung. Ketik *Menu* untuk kembali ke halaman utama."\n\nTampilkan informasi lengkap produk yang dipilih pelanggan berdasarkan nomornya.\n\nFormat balasan:\n———————————————\n🛍️ *[NAMA PRODUK]*\n\n💰 Harga: Rp [HARGA]\n🏷️ Kategori: [KATEGORI]\n📝 Deskripsi: [DESKRIPSI PRODUK]\n\n🛒 Beli sekarang di Shopee:\n[LINK PRODUK]\n———————————————\nKetik *Menu* untuk kembali 🏠\nKetik kode kategori untuk lihat produk lain 🔠`;
+
+        const currentCategory = userSession.get(senderNumber);
+        
+        if (currentCategory) {
+          customBehavior.ignoreContextCheck = true;
+          customBehavior.ignoreSentenceLimit = true;
+        }
+
+        if (currentCategory === 'kalung') {
+          customBehavior.system_instructions = `Kamu adalah asisten produk kategori KALUNG di Bunga Tanjung Official Shop.\n\nData produk kalung yang tersedia:\n1. KALUNG ITALY SANTA DEWASA UNISEX EMAS 17K BUNGA TANJUNG GOLD - Rp 5.056.000 - https://shopee.co.id/KALUNG-ITALY-SANTA-DEWASA-UNISEX-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.12907109035\n2. KALUNG SUPER FLAT HOLOGRAM FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 13.860.000 - https://shopee.co.id/KALUNG-SUPER-FLAT-HOLOGRAM-FLOWER-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.41375778931\n3. KALUNG HERME ROSE GOLD EMAS 17K BUNGA TANJUNG GOLD - Rp 7.809.000 - https://shopee.co.id/KALUNG-HERME-ROSE-GOLD-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.10189979051\n4. KALUNG HOLLOW LUXURY EMAS 17K BUNGA TANJUNG GOLD - Rp 5.292.000 - https://shopee.co.id/KALUNG-HOLLOW-LUXURY-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.41410520579\n5. KALUNG CLOVER ARSIR BUNGA 5 EMAS 17K BUNGA TANJUNG GOLD - Rp 12.852.000 - https://shopee.co.id/KALUNG-CLOVER-ARSIR-BUNGA-5-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27808251560\n6. KALUNG SOLENE ETERNA BLOOM SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 10.836.000 - https://shopee.co.id/KALUNG-SOLENE-ETERNA-BLOOM-SYIFA-HADJU-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.42980436422\n7. KALUNG VAR 42 EMAS 17K BUNGA TANJUNG GOLD - Rp 9.027.850 - https://shopee.co.id/KALUNG-VAR-42-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28080584329\n8. KALUNG POLOS SERUT RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.276.000 - https://shopee.co.id/KALUNG-POLOS-SERUT-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16869984451\n9. KALUNG SOLENE NELDJU SYIFA HADJU EMAS 17K BUNGA TANJUNG GOLD - Rp 7.560.000 - https://shopee.co.id/KALUNG-SOLENE-NELDJU-SYIFA-HADJU-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.57459608612\n10. KALUNG HOLLOW TETES LIE EMAS 17K BUNGA TANJUNG GOLD - Rp 5.796.000 - https://shopee.co.id/KALUNG-HOLLOW-TETES-LIE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.51309756294\n\n${ruleText}`;
+        } else if (currentCategory === 'gelang') {
+          customBehavior.system_instructions = `Kamu adalah asisten produk kategori GELANG di Bunga Tanjung Official Shop.\n\nData produk gelang yang tersedia:\n1. GELANG TALI PIXIU PI XIU CHARM DRAGON EMAS 23K BUNGA TANJUNG GOLD - Rp 3.850.000 - https://shopee.co.id/GELANG-TALI-PIXIU-PI-XIU-CHARM-DRAGON-EMAS-23K-BUNGA-TANJUNG-GOLD-i.48895190.14100954145\n2. GELANG WILLOW LEAF DAUN EMAS 17K BUNGA TANJUNG GOLD - Rp 6.450.000 - https://shopee.co.id/GELANG-WILLOW-LEAF-DAUN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.26380245317\n3. GELANG CLASSIC KOREA TWIST SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 2.890.000 - https://shopee.co.id/GELANG-CLASSIC-KOREA-TWIST-SUPER-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.24691751226\n4. GELANG CHARLOTTE GOLD LARGE EMAS 17K BUNGA TANJUNG GOLD - Rp 8.750.000 - https://shopee.co.id/GELANG-CHARLOTTE-GOLD-LARGE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.14371428306\n5. GELANG HERME BELL EMAS 17K BUNGA TANJUNG GOLD - Rp 5.950.000 - https://shopee.co.id/GELANG-HERME-BELL-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.17000780680\n6. GELANG FANIA TWIN LAYER KUPU EMAS 18K BUNGA TANJUNG GOLD - Rp 4.120.000 - https://shopee.co.id/GELANG-FANIA-TWIN-LAYER-KUPU-EMAS-18K-BUNGA-TANJUNG-GOLD-i.48895190.45410494905\n7. GELANG CLOVER FLOWER EMAS 17K BUNGA TANJUNG GOLD - Rp 5.340.000 - https://shopee.co.id/GELANG-CLOVER-FLOWER-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22039932427\n8. GELANG CHARLOTTE GOLD SUPER RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.150.000 - https://shopee.co.id/GELANG-CHARLOTTE-GOLD-SUPER-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28682898388\n9. GELANG LUXURY RINGAN EMAS 17K BUNGA TANJUNG GOLD - Rp 3.680.000 - https://shopee.co.id/GELANG-LUXURY-RINGAN-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.23068676071\n10. GELANG PAPERCLIP VARIASI EMAS 17K BUNGA TANJUNG GOLD - Rp 4.790.000 - https://shopee.co.id/GELANG-PAPERCLIP-VARIASI-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.17625874784\n\n${ruleText}`;
+        } else if (currentCategory === 'cincin') {
+          customBehavior.system_instructions = `Kamu adalah asisten produk kategori CINCIN di Bunga Tanjung Official Shop.\n\nData produk cincin yang tersedia:\n1. CINCIN NIKAH DAPHNE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.500.000 - https://shopee.co.id/CINCIN-NIKAH-DAPHNE-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.20182095735\n2. CINCIN NIKAH SABINA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.850.000 - https://shopee.co.id/CINCIN-NIKAH-SABINA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.29844774891\n3. CINCIN NIKAH QEELA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.200.000 - https://shopee.co.id/CINCIN-NIKAH-QEELA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.54309979785\n4. CINCIN NIKAH MARETTA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.100.000 - https://shopee.co.id/CINCIN-NIKAH-MARETTA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28676038237\n5. CINCIN NIKAH KEYNA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.650.000 - https://shopee.co.id/CINCIN-NIKAH-KEYNA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22852625776\n6. CINCIN NIKAH FALYN WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.350.000 - https://shopee.co.id/CINCIN-NIKAH-FALYN-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16895554931\n7. CINCIN NIKAH LIANA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.900.000 - https://shopee.co.id/CINCIN-NIKAH-LIANA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22746439452\n8. CINCIN NIKAH RENATA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.750.000 - https://shopee.co.id/CINCIN-NIKAH-RENATA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.28179816101\n9. CINCIN NIKAH CHLOE WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 5.250.000 - https://shopee.co.id/CINCIN-NIKAH-CHLOE-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.16792327862\n10. CINCIN NIKAH FARRA WEDDING RING EMAS 17K BUNGA TANJUNG GOLD - Rp 4.400.000 - https://shopee.co.id/CINCIN-NIKAH-FARRA-WEDDING-RING-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.24126805720\n\n${ruleText}`;
+        } else if (currentCategory === 'anting') {
+          customBehavior.system_instructions = `Kamu adalah asisten produk kategori ANTING di Bunga Tanjung Official Shop.\n\nData produk anting yang tersedia:\n1. ANTING KOLONGAN BAYI BABY EMAS KADAR 17K BUNGA TANJUNG - Rp 1.250.000 - https://shopee.co.id/ANTING-KOLONGAN-BAYI-BABY-EMAS-KADAR-17K-BUNGA-TANJUNG-i.48895190.22329430632\n2. ANTING JEPIT BLINK EMAS 17K BUNGA TANJUNG GOLD - Rp 2.450.000 - https://shopee.co.id/ANTING-JEPIT-BLINK-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.21057737936\n3. ANTING TINDIK CLOVER LY EMAS 17K BUNGA TANJUNG GOLD - Rp 1.850.000 - https://shopee.co.id/ANTING-TINDIK-CLOVER-LY-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.22559447947\n4. ANTING TINDIK ATOM SUPER RINGAN ROSE EMAS 17K BUNGA TANJUNG GOLD - Rp 1.450.000 - https://shopee.co.id/ANTING-TINDIK-ATOM-SUPER-RINGAN-ROSE-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.55904370292\n5. ANTING TINDIK TETES AIR EMAS 17K BUNGA TANJUNG GOLD - Rp 2.150.000 - https://shopee.co.id/ANTING-TINDIK-TETES-AIR-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27755932774\n6. ANTING KLIP KUPU KUPU BLINK B EMAS 17K BUNGA TANJUNG GOLD - Rp 2.850.000 - https://shopee.co.id/ANTING-KLIP-KUPU-KUPU-BLINK-B-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.53356754186\n7. ANTING TINDIK KIPAS BS EMAS 17K BUNGA TANJUNG GOLD - Rp 1.950.000 - https://shopee.co.id/ANTING-TINDIK-KIPAS-BS-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.43022899115\n8. ANTING KLIP FLOWER C EMAS 17K BUNGA TANJUNG GOLD - Rp 2.650.000 - https://shopee.co.id/ANTING-KLIP-FLOWER-C-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27987809894\n9. ANTING KLIP LISTRING E EMAS 17K BUNGA TANJUNG GOLD - Rp 2.300.000 - https://shopee.co.id/ANTING-KLIP-LISTRING-E-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.27837288430\n10. ANTING KLIP CLOVER A EMAS 17K BUNGA TANJUNG GOLD - Rp 2.750.000 - https://shopee.co.id/ANTING-KLIP-CLOVER-A-EMAS-17K-BUNGA-TANJUNG-GOLD-i.48895190.23873730300\n\n${ruleText}`;
+        }
 
         const aiResponse = await Promise.race([
-          getAIResponse(msg.body, contextItems, behavior),
+          getAIResponse(msg.body, contextItems, customBehavior),
           timeoutPromise
         ]);
 
